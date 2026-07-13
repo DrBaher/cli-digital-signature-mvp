@@ -115,6 +115,13 @@ test("runLocalDemo produces a bundle with a verifiable signed PDF and a valid au
       assert.equal(result.messageDigestVerified, true);
       assert.equal(result.signatureCount, 1);
       assert.match(result.signedPdfPath, /signed\.pdf$/);
+      // The demo drives the consent flow end-to-end: both gates must have
+      // actually blocked a sign attempt before the attestations satisfied them.
+      assert.deepEqual(result.consent.gatesEnforced, ["EMAIL_VERIFICATION_REQUIRED", "CONSENT_REQUIRED"]);
+      assert.ok(result.consent.emailVerifiedAt);
+      assert.ok(result.consent.intentToSignAcceptedAt);
+      assert.ok(result.consent.esignDisclosureAcceptedAt);
+      assert.equal(result.consent.identityAssuranceMethod, "known-contact");
 
       const fs = await import("node:fs");
       assert.ok(fs.existsSync(path.join(dir, "manifest.json")));

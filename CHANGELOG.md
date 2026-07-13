@@ -30,6 +30,16 @@ release.
   with `--auto-approve` is rejected. `request show` now includes a per-signer
   `consent` block. New docs: `docs/reference/consent-and-identity.md`.
 
+### Changed
+- **`sign demo` now showcases the consent flow.** Both gates are enabled on the
+  demo request; the demo drives real blocked sign attempts
+  (`EMAIL_VERIFICATION_REQUIRED`, `CONSENT_REQUIRED`), verifies the signer
+  email, captures the consent attestations + an identity-assurance record, then
+  approves and signs through the token path (no more `--auto-approve` +
+  provider auto-complete). The result gains a `consent` block; any configured
+  `SIGN_VERIFICATION_WEBHOOK_URL` is ignored during the demo so codes never
+  leave the machine.
+
 ## [0.8.0] — 2026-06-21
 
 SignWell field-placement fixes from field feedback, plus signing-order control,

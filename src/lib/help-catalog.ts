@@ -60,7 +60,7 @@ export const HELP_CATALOG: CommandSpec[] = [
   },
   {
     command: "demo",
-    summary: "Run the local-provider end-to-end demo: create + send + sign + bundle.",
+    summary: "Run the local-provider end-to-end demo with the consent flow: create (both gates on) → send → blocked sign attempts → email verification → consent attestations → approve → sign → bundle.",
     flags: [
       { name: "--document", description: "PDF to sign (optional; demo generates one if omitted)." },
       { name: "--out", description: "Bundle output directory (defaults to ./demo-bundle)." },

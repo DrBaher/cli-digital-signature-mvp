@@ -4020,6 +4020,13 @@ export async function runLocalDemo(
   bundleDir: string;
   attempts: number;
   elapsedMs: number;
+  consent: {
+    gatesEnforced: string[];
+    emailVerifiedAt: string;
+    intentToSignAcceptedAt: string;
+    esignDisclosureAcceptedAt: string;
+    identityAssuranceMethod: string;
+  };
 }> {
   const onProgress = input.onProgress ?? (() => {});
   const path = await import("node:path");
@@ -4043,16 +4050,19 @@ trailer << /Root 1 0 R /Size 5 >>
     documentPath = generatedPath;
   }
 
-  onProgress(`[demo] creating local request from ${documentPath}`);
+  onProgress(`[demo] creating local request from ${documentPath} (consent + email-verification gates ON)`);
   const created = createSigningRequest(db, {
     title: "Sign CLI demo",
     documentPath,
     signers: [{ name: "Demo Signer", email: "demo-signer@example.com", order: 1 }],
     tokenTtlMinutes: 30,
     provider: "local",
-    autoApprove: true,
+    requireConsent: true,
+    requireEmailVerification: true,
     now: input.now,
   });
+  const demoToken = created.tokens[0].token;
+  const demoSignerEmail = created.tokens[0].signer.email;
 
   onProgress("[demo] sending via local provider");
   const sent = await sendSigningRequest(db, {
@@ -4062,7 +4072,62 @@ trailer << /Root 1 0 R /Size 5 >>
     now: input.now,
   });
 
-  onProgress("[demo] watching status (local provider auto-completes after first poll)");
+  // The demo drives the gates the way a real signer hits them: each blocked
+  // attempt below is the shared enforcement in signSigningRequest doing its
+  // job (the same check the MCP `sign` tool and POST /v1/sign run into).
+  const gatesEnforced: string[] = [];
+  const expectGateBlock = (expectedCode: string, label: string) => {
+    try {
+      signSigningRequest(db, { requestId: created.requestId, token: demoToken, now: input.now });
+      throw new Error(`Local demo: expected ${expectedCode} to block signing (${label}), but sign succeeded.`);
+    } catch (error) {
+      if (!(error instanceof SignCliError) || error.code !== expectedCode) throw error;
+      gatesEnforced.push(error.code);
+      onProgress(`[demo] sign attempt ${label} → blocked with ${error.code} (as designed)`);
+    }
+  };
+
+  expectGateBlock("EMAIL_VERIFICATION_REQUIRED", "before email verification");
+
+  onProgress("[demo] issuing email-verification code (hashed at rest; the audit chain sees only a masked hint)");
+  // The demo stays fully offline: suppress any configured verification webhook
+  // so demo codes never leave the machine.
+  const savedWebhookUrl = process.env.SIGN_VERIFICATION_WEBHOOK_URL;
+  delete process.env.SIGN_VERIFICATION_WEBHOOK_URL;
+  let issued;
+  try {
+    issued = await issueSignerEmailVerification(db, {
+      requestId: created.requestId,
+      signerEmail: demoSignerEmail,
+      now: input.now,
+    });
+  } finally {
+    if (savedWebhookUrl !== undefined) process.env.SIGN_VERIFICATION_WEBHOOK_URL = savedWebhookUrl;
+  }
+  onProgress(`[demo] verifying code ${issued.codeHint} → request.signer_email_verified`);
+  const verified = verifySignerEmailCode(db, {
+    requestId: created.requestId,
+    signerEmail: demoSignerEmail,
+    code: issued.code,
+    now: input.now,
+  });
+
+  expectGateBlock("CONSENT_REQUIRED", "before consent");
+
+  onProgress("[demo] approving with --agree + --accept-disclosure (+ an identity-assurance record)");
+  const approved = approveSigningRequest(db, {
+    requestId: created.requestId,
+    token: demoToken,
+    agree: true,
+    acceptDisclosure: true,
+    identityAssurance: { method: "known-contact", verifier: "sign-cli demo", reference: "demo-run" },
+    now: input.now,
+  });
+
+  onProgress("[demo] signing with the approval token (PAdES-seals the PDF with the signer's local cert)");
+  signSigningRequest(db, { requestId: created.requestId, token: demoToken, now: input.now });
+
+  onProgress("[demo] watching status and fetching the signed PDF");
   const watch = await watchSigningRequestStatus(db, {
     requestId: created.requestId,
     provider: "local",
@@ -4103,6 +4168,13 @@ trailer << /Root 1 0 R /Size 5 >>
     bundleDir: outDir,
     attempts: watch.attempts,
     elapsedMs: watch.elapsedMs,
+    consent: {
+      gatesEnforced,
+      emailVerifiedAt: verified.verifiedAt,
+      intentToSignAcceptedAt: approved.consent!.intentToSignAcceptedAt!,
+      esignDisclosureAcceptedAt: approved.consent!.esignDisclosureAcceptedAt!,
+      identityAssuranceMethod: "known-contact",
+    },
   };
 }
 

@@ -16,7 +16,7 @@ Fully-offline e-signature CLI. The built-in PAdES signer (PKCS#7 in `/ByteRange`
 npx @drbaher/sign-cli demo
 ```
 
-That single command runs the entire lifecycle — create → send → sign → verify chain → export receipt — against the offline local provider, then deletes everything. No signup. No keys. ~5 seconds.
+That single command runs the entire lifecycle — create (consent + email-verification gates on) → send → watch the gates block signing → verify email → capture consent → approve → sign → verify chain → export receipt — against the offline local provider, then deletes everything. No signup. No keys. ~5 seconds.
 
 > **[Live demo →](https://sign-cli-demo-production.up.railway.app/web-demo/)** — read-only, resets every 4 hours. Self-host: see [`deploy/README.md`](deploy/README.md).
 
