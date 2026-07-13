@@ -6,7 +6,7 @@ All notable changes to `sign-cli`. Format follows [Keep a Changelog](https://kee
 since the last tag — use it to seed the `[Unreleased]` section before a
 release.
 
-## [Unreleased]
+## [0.9.0] — 2026-07-13
 
 ### Added
 - **Consent capture**: `request create --require-consent true` gates signing on
