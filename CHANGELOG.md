@@ -8,6 +8,28 @@ release.
 
 ## [Unreleased]
 
+### Added
+- **Consent capture**: `request create --require-consent true` gates signing on
+  each signer attesting intent-to-sign and accepting the electronic-records
+  (ESIGN) disclosure via `approve --agree true --accept-disclosure true`. The
+  canonical statement texts are versioned (`sign consent show`) and recorded in
+  the audit chain (`request.consent_captured`, `request.esign_consent_captured`)
+  with their SHA-256 and timestamp.
+- **Signer email verification**: `request create --require-email-verification
+  true` gates signing on proof of mailbox control. New commands `signer
+  send-verification` (6-digit code, hashed at rest, 15-min TTL, 5-attempt
+  lockout, optional delivery via `SIGN_VERIFICATION_WEBHOOK_URL`) and `signer
+  verify-email`; `approve --verification-code` redeems in one step. Audit
+  events: `request.signer_verification_issued`, `request.signer_email_verified`.
+- **Identity-assurance records**: `signer record-identity --identity-assurance
+  method:...,verifier:...,reference:...` (also inline on `approve`) records how
+  a signer's identity was checked out-of-band — the assertion, never the
+  evidence — as `request.identity_assurance_recorded`.
+- Both gates are enforced in the shared signing service, so the CLI `sign`
+  command, MCP `sign` tool, and `POST /v1/sign` all honor them; combining them
+  with `--auto-approve` is rejected. `request show` now includes a per-signer
+  `consent` block. New docs: `docs/reference/consent-and-identity.md`.
+
 ## [0.8.0] — 2026-06-21
 
 SignWell field-placement fixes from field feedback, plus signing-order control,

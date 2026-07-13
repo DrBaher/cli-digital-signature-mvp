@@ -25,6 +25,17 @@ reality you can point to:
   model.
 - **Per-signer approval tokens** — TTL-bounded, single-use, scoped to
   one signer's email. Designed for a human to gate each signature.
+- **Recorded intent-to-sign + electronic-records consent** (optional,
+  `--require-consent`) — versioned canonical statements the signer
+  accepts at approval, captured in the audit chain with the statement's
+  SHA-256 and timestamp. See
+  [`consent-and-identity.md`](./consent-and-identity.md).
+- **Signer email verification** (optional,
+  `--require-email-verification`) — a hashed, TTL-bounded, single-use
+  code proves the signer controls the mailbox before signing is allowed.
+- **Identity-assurance records** — `sign signer record-identity` logs
+  *how* identity was checked out-of-band (method + pointer to evidence),
+  in the audit chain.
 - **Optional RFC 3161 timestamping** via `sign audit timestamp` /
   `sign audit anchor`. Anchors the chain head against a public TSA.
 - **Re-verifiable receipt bundles** — `sign audit export` writes a
@@ -34,8 +45,12 @@ reality you can point to:
 What's missing, deliberately, from the local provider:
 
 - **No identity verification.** Anyone can run `sign request create
-  --signer name:Alice,email:alice@example.com`. Whether the email
-  actually belongs to Alice is your concern, not the CLI's.
+  --signer name:Alice,email:alice@example.com`. Email verification
+  proves control of the mailbox, and the identity-assurance record
+  captures your out-of-band checks — but neither verifies that the
+  person is legally Alice. That requires a hosted provider's IDV or a
+  QTSP, and the CLI deliberately collects no identity documents itself
+  (see [`consent-and-identity.md`](./consent-and-identity.md)).
 - **No qualified certificate** from a Qualified Trust Service Provider
   (QTSP). The cert is self-signed by `Sign CLI Local Provider`.
 - **No long-term validation (LTV)** with CRL/OCSP staples.
@@ -244,6 +259,14 @@ Strong evidentiary posture:
 - Approval tokens emailed to verified business addresses
 - One human gesture per signer (don't auto-approve and auto-sign with
   no review)
+- `--require-consent true` on the request, so every signer's
+  intent-to-sign + electronic-records consent is captured in the audit
+  chain (see [`consent-and-identity.md`](./consent-and-identity.md))
+- `--require-email-verification true`, so signing is gated on proof of
+  mailbox control — with the code delivered to the signer's email, not
+  alongside the token
+- `sign signer record-identity` whenever you actually checked who you
+  were dealing with
 - `sign audit timestamp` after every meaningful event
 - Receipt bundles exported and retained per `docs/recipes/`
 

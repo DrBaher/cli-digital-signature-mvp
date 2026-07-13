@@ -135,6 +135,33 @@ export function openDatabase(dbPath: string): SqliteDb {
       PRIMARY KEY (scope, key)
     );
 
+    CREATE TABLE IF NOT EXISTS signer_consents (
+      id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      signer_email TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      statement_version TEXT NOT NULL,
+      statement_sha256 TEXT NOT NULL,
+      statement_text TEXT NOT NULL,
+      accepted_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE (request_id, signer_email, kind),
+      FOREIGN KEY (request_id) REFERENCES requests(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS signer_email_verifications (
+      id TEXT PRIMARY KEY,
+      request_id TEXT NOT NULL,
+      signer_email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      code_hint TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      verified_at TEXT,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (request_id) REFERENCES requests(id)
+    );
+
     CREATE TABLE IF NOT EXISTS signer_signing_states (
       request_id TEXT NOT NULL,
       signer_email TEXT NOT NULL,
@@ -172,6 +199,12 @@ export function openDatabase(dbPath: string): SqliteDb {
   }
   if (!hasColumn(db, "requests", "prefills_json")) {
     db.exec("ALTER TABLE requests ADD COLUMN prefills_json TEXT");
+  }
+  if (!hasColumn(db, "requests", "require_consent")) {
+    db.exec("ALTER TABLE requests ADD COLUMN require_consent INTEGER");
+  }
+  if (!hasColumn(db, "requests", "require_email_verification")) {
+    db.exec("ALTER TABLE requests ADD COLUMN require_email_verification INTEGER");
   }
 
   installAuditAppendOnlyTriggers(db);

@@ -56,6 +56,7 @@ Or download a standalone binary from [Releases](https://github.com/DrBaher/sign-
 - **Offline PAdES signing** with a self-issued cert — real PKCS#7 signed PDFs, no signup, no API keys.
 - **Three hosted providers** when you need them: Dropbox Sign, DocuSign, SignWell. Same surface across all four.
 - **Per-signer approval tokens** (single-use, TTL-bounded, tied to one email). Tokens go to the human, not the agent.
+- **Consent + attribution evidence, opt-in per request**: `--require-consent` gates signing on a recorded intent-to-sign attestation + electronic-records consent (versioned canonical texts, hashed into the audit chain); `--require-email-verification` gates it on a mailbox-control code; `signer record-identity` logs how identity was checked out-of-band. No KYC data is collected — by design. See [docs/reference/consent-and-identity.md](docs/reference/consent-and-identity.md).
 - **Hash-chained audit chain** with append-only DB triggers + RFC 3161 anchors. See [docs/reference/audit-chain.md](docs/reference/audit-chain.md).
 - **Idempotent `request send`** — refuses to double-send unless `--force true`; pair with `--idempotency-key` for safe retries.
 - **Multi-document + multi-signer** requests; CSV-driven bulk send.

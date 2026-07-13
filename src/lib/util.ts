@@ -37,6 +37,16 @@ export function tokenHint(token: string): string {
   return `${token.slice(0, 6)}...${token.slice(-4)}`;
 }
 
+/** 6-digit numeric code for signer email verification — short enough to type
+ *  from a phone, brute-force-bounded by the attempts counter on the row. */
+export function createVerificationCode(): string {
+  return String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
+}
+
+export function verificationCodeHint(code: string): string {
+  return `${code.slice(0, 1)}****${code.slice(-1)}`;
+}
+
 export function stableStringify(value: unknown): string {
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(",")}]`;

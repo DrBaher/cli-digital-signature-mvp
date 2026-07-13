@@ -86,16 +86,25 @@ import {
   type LocalSignerInboxEntry,
 } from "./local-provider.js";
 import { evaluatePolicy, type PolicyDecision, type PolicySpec } from "./policy-engine.js";
+import {
+  ESIGN_DISCLOSURE_STATEMENT,
+  INTENT_TO_SIGN_STATEMENT,
+  statementSha256,
+  type ConsentStatement,
+  type IdentityAssuranceInput,
+} from "./consent.js";
 import { lookupIdempotencyKey, persistIdempotencyKey } from "./idempotency.js";
 import { assertProviderMatchesPersisted, resolveSignProvider, type SignProvider } from "./providers.js";
 import { SignCliError } from "./sign-error.js";
 import {
   createId,
   createToken,
+  createVerificationCode,
   nowIso,
   sha256,
   stableStringify,
   tokenHint,
+  verificationCodeHint,
 } from "./util.js";
 import type { PrefillInput, SignerInput } from "./util.js";
 import { verifyDropboxCallback } from "./webhook.js";
@@ -120,6 +129,11 @@ export type CreateRequestInput = {
   prefills?: PrefillInput[];
   tokenTtlMinutes: number;
   autoApprove?: boolean;
+  /** Require every signer to attest intent-to-sign + accept the electronic-records
+   *  disclosure (via `approve --agree true --accept-disclosure true`) before they can sign. */
+  requireConsent?: boolean;
+  /** Require every signer to prove control of their email (verification code) before they can sign. */
+  requireEmailVerification?: boolean;
   provider?: SignProvider;
   idempotencyKey?: string;
   now?: Date;
@@ -142,6 +156,8 @@ type RequestRow = {
   fields_json: string | null;
   template_id: string | null;
   prefills_json: string | null;
+  require_consent: number | null;
+  require_email_verification: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -1093,6 +1109,13 @@ export function createSigningRequest(
   if (!Number.isFinite(input.tokenTtlMinutes) || input.tokenTtlMinutes <= 0) {
     throw new Error("--token-ttl-minutes must be a positive number.");
   }
+  if (input.autoApprove && (input.requireConsent || input.requireEmailVerification)) {
+    throw new SignCliError({
+      code: "INVALID_ARGS",
+      message: "--auto-approve cannot be combined with --require-consent or --require-email-verification.",
+      hint: "Those gates exist precisely so the approval step cannot be skipped; drop --auto-approve.",
+    });
+  }
 
   const sortedSigners = [...input.signers].sort((left, right) => left.order - right.order);
   const duplicateOrders = new Set<number>();
@@ -1159,8 +1182,8 @@ export function createSigningRequest(
 
   db.prepare(
     `INSERT INTO requests (
-      id, title, document_path, document_hash, status, provider, provider_request_id, provider_status, dropbox_signature_request_id, dropbox_status, signature_ids_json, signers_json, documents_json, fields_json, template_id, prefills_json, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id, title, document_path, document_hash, status, provider, provider_request_id, provider_status, dropbox_signature_request_id, dropbox_status, signature_ids_json, signers_json, documents_json, fields_json, template_id, prefills_json, require_consent, require_email_verification, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     requestId,
     input.title,
@@ -1178,6 +1201,8 @@ export function createSigningRequest(
     fieldsJson,
     input.templateId ?? null,
     prefillsJson,
+    input.requireConsent ? 1 : 0,
+    input.requireEmailVerification ? 1 : 0,
     createdAt,
     createdAt,
   );
@@ -1232,6 +1257,8 @@ export function createSigningRequest(
       signers: sortedSigners,
       tokenTtlMinutes: input.tokenTtlMinutes,
       autoApprove: Boolean(input.autoApprove),
+      requireConsent: Boolean(input.requireConsent),
+      requireEmailVerification: Boolean(input.requireEmailVerification),
     },
     now,
   });
@@ -1255,13 +1282,409 @@ export function createSigningRequest(
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Consent, email verification, identity assurance
+//
+// These strengthen the *legal* posture of the approve → sign gate: the audit
+// chain gains explicit intent-to-sign + electronic-records-consent
+// attestations (what ESIGN/UETA case law actually asks about), and optional
+// email-control proof. None of it verifies government identity — that stays
+// with hosted-provider IDV or a QTSP (see docs/reference/legal.md).
+// ---------------------------------------------------------------------------
+
+type SignerConsentRow = {
+  id: string;
+  request_id: string;
+  signer_email: string;
+  kind: string;
+  statement_version: string;
+  statement_sha256: string;
+  statement_text: string;
+  accepted_at: string;
+  created_at: string;
+};
+
+type SignerEmailVerificationRow = {
+  id: string;
+  request_id: string;
+  signer_email: string;
+  code_hash: string;
+  code_hint: string;
+  expires_at: string;
+  verified_at: string | null;
+  attempts: number;
+  created_at: string;
+};
+
+const VERIFICATION_MAX_ATTEMPTS = 5;
+const VERIFICATION_DEFAULT_TTL_MINUTES = 15;
+
+export function requestRequiresConsent(request: { require_consent: number | null }): boolean {
+  return Boolean(request.require_consent);
+}
+
+export function requestRequiresEmailVerification(request: { require_email_verification: number | null }): boolean {
+  return Boolean(request.require_email_verification);
+}
+
+function getSignerConsent(
+  db: SqliteDb,
+  requestId: string,
+  signerEmail: string,
+  kind: ConsentStatement["kind"],
+): SignerConsentRow | undefined {
+  return db.prepare(
+    "SELECT * FROM signer_consents WHERE request_id = ? AND lower(signer_email) = lower(?) AND kind = ?",
+  ).get(requestId, signerEmail.trim(), kind) as SignerConsentRow | undefined;
+}
+
+// Idempotent: re-accepting an already-recorded statement is a no-op (the
+// original acceptance timestamp is the legally meaningful one).
+function recordSignerConsent(
+  db: SqliteDb,
+  input: {
+    requestId: string;
+    signerEmail: string;
+    signerOrder: number;
+    statement: ConsentStatement;
+    now: Date;
+  },
+): { acceptedAt: string; alreadyRecorded: boolean } {
+  const existing = getSignerConsent(db, input.requestId, input.signerEmail, input.statement.kind);
+  if (existing) {
+    return { acceptedAt: existing.accepted_at, alreadyRecorded: true };
+  }
+  const acceptedAt = nowIso(input.now);
+  db.prepare(
+    `INSERT INTO signer_consents (
+      id, request_id, signer_email, kind, statement_version, statement_sha256, statement_text, accepted_at, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    createId("cns"),
+    input.requestId,
+    input.signerEmail,
+    input.statement.kind,
+    input.statement.version,
+    statementSha256(input.statement),
+    input.statement.text,
+    acceptedAt,
+    acceptedAt,
+  );
+  appendAuditEvent(db, {
+    requestId: input.requestId,
+    eventType: input.statement.kind === "intent_to_sign"
+      ? "request.consent_captured"
+      : "request.esign_consent_captured",
+    payload: {
+      signerEmail: input.signerEmail,
+      signerOrder: input.signerOrder,
+      statementVersion: input.statement.version,
+      statementSha256: statementSha256(input.statement),
+      statementText: input.statement.text,
+      acceptedAt,
+    },
+    now: input.now,
+  });
+  return { acceptedAt, alreadyRecorded: false };
+}
+
+function getVerifiedEmailAt(db: SqliteDb, requestId: string, signerEmail: string): string | null {
+  const row = db.prepare(
+    `SELECT verified_at FROM signer_email_verifications
+     WHERE request_id = ? AND lower(signer_email) = lower(?) AND verified_at IS NOT NULL
+     ORDER BY verified_at DESC LIMIT 1`,
+  ).get(requestId, signerEmail.trim()) as { verified_at: string } | undefined;
+  return row?.verified_at ?? null;
+}
+
+function findSignerOnRequest(request: RequestRow, signerEmail: string): SignerInput {
+  const signers = JSON.parse(request.signers_json) as SignerInput[];
+  const normalized = signerEmail.trim().toLowerCase();
+  const signer = signers.find((entry) => entry.email.trim().toLowerCase() === normalized);
+  if (!signer) {
+    throw new SignCliError({
+      code: "SIGNER_NOT_RECIPIENT",
+      message: `${signerEmail} is not a signer on request ${request.id}.`,
+      hint: "Check `request show` for the signer list.",
+      details: { requestId: request.id, signerEmail },
+    });
+  }
+  return signer;
+}
+
+export type IssueVerificationResult = {
+  requestId: string;
+  signerEmail: string;
+  /** Plaintext code — returned once for delivery to the signer's mailbox; only its hash is stored. */
+  code: string;
+  codeHint: string;
+  expiresAt: string;
+  deliveredVia: "webhook" | "manual";
+  deliveryError?: string;
+};
+
+/**
+ * Issue a fresh email-verification code for a signer. Any prior unverified
+ * codes for the same signer are invalidated. If SIGN_VERIFICATION_WEBHOOK_URL
+ * is set, the code is POSTed there (wire it to your mailer) — otherwise the
+ * caller must deliver it to the signer's mailbox out-of-band; the attribution
+ * value of the verification depends on that delivery reaching the mailbox.
+ */
+export async function issueSignerEmailVerification(
+  db: SqliteDb,
+  input: { requestId: string; signerEmail: string; ttlMinutes?: number; now?: Date },
+): Promise<IssueVerificationResult> {
+  const request = getRequestRow(db, input.requestId);
+  const signer = findSignerOnRequest(request, input.signerEmail);
+  const now = input.now ?? new Date();
+  const ttlMinutes = input.ttlMinutes ?? VERIFICATION_DEFAULT_TTL_MINUTES;
+  if (!Number.isFinite(ttlMinutes) || ttlMinutes <= 0) {
+    throw new SignCliError({ code: "INVALID_ARGS", message: "--ttl-minutes must be a positive number." });
+  }
+  db.prepare(
+    "DELETE FROM signer_email_verifications WHERE request_id = ? AND lower(signer_email) = lower(?) AND verified_at IS NULL",
+  ).run(request.id, signer.email);
+
+  const code = createVerificationCode();
+  const codeHint = verificationCodeHint(code);
+  const expiresAt = nowIso(new Date(now.getTime() + ttlMinutes * 60_000));
+  db.prepare(
+    `INSERT INTO signer_email_verifications (
+      id, request_id, signer_email, code_hash, code_hint, expires_at, verified_at, attempts, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, NULL, 0, ?)`,
+  ).run(createId("ver"), request.id, signer.email, sha256(code), codeHint, expiresAt, nowIso(now));
+
+  let deliveredVia: "webhook" | "manual" = "manual";
+  let deliveryError: string | undefined;
+  const webhookUrl = process.env.SIGN_VERIFICATION_WEBHOOK_URL;
+  if (webhookUrl) {
+    try {
+      const response = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          requestId: request.id,
+          signerEmail: signer.email,
+          signerName: signer.name,
+          code,
+          expiresAt,
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.ok) {
+        deliveredVia = "webhook";
+      } else {
+        deliveryError = `Verification webhook returned HTTP ${response.status}; deliver the code manually.`;
+      }
+    } catch (error) {
+      deliveryError = `Verification webhook unreachable (${(error as Error).message}); deliver the code manually.`;
+    }
+  }
+
+  // The plaintext code never enters the audit chain — only the hint.
+  appendAuditEvent(db, {
+    requestId: request.id,
+    eventType: "request.signer_verification_issued",
+    payload: {
+      signerEmail: signer.email,
+      signerOrder: signer.order,
+      codeHint,
+      expiresAt,
+      deliveredVia,
+    },
+    now,
+  });
+
+  return {
+    requestId: request.id,
+    signerEmail: signer.email,
+    code,
+    codeHint,
+    expiresAt,
+    deliveredVia,
+    ...(deliveryError ? { deliveryError } : {}),
+  };
+}
+
+export function verifySignerEmailCode(
+  db: SqliteDb,
+  input: { requestId: string; signerEmail: string; code: string; now?: Date },
+): { requestId: string; signerEmail: string; verifiedAt: string; codeHint: string } {
+  const request = getRequestRow(db, input.requestId);
+  const signer = findSignerOnRequest(request, input.signerEmail);
+  const now = input.now ?? new Date();
+
+  const alreadyVerifiedAt = getVerifiedEmailAt(db, request.id, signer.email);
+  if (alreadyVerifiedAt) {
+    const row = db.prepare(
+      `SELECT code_hint FROM signer_email_verifications
+       WHERE request_id = ? AND lower(signer_email) = lower(?) AND verified_at IS NOT NULL
+       ORDER BY verified_at DESC LIMIT 1`,
+    ).get(request.id, signer.email) as { code_hint: string };
+    return { requestId: request.id, signerEmail: signer.email, verifiedAt: alreadyVerifiedAt, codeHint: row.code_hint };
+  }
+
+  const pending = db.prepare(
+    `SELECT * FROM signer_email_verifications
+     WHERE request_id = ? AND lower(signer_email) = lower(?) AND verified_at IS NULL
+     ORDER BY created_at DESC LIMIT 1`,
+  ).get(request.id, signer.email) as SignerEmailVerificationRow | undefined;
+
+  if (!pending) {
+    throw new SignCliError({
+      code: "VERIFICATION_CODE_INVALID",
+      message: `No active verification code for ${signer.email} on request ${request.id}.`,
+      hint: "Issue one with `sign signer send-verification --request-id <id> --email <signer>`.",
+      details: { requestId: request.id, signerEmail: signer.email },
+    });
+  }
+  if (new Date(pending.expires_at).getTime() < now.getTime()) {
+    throw new SignCliError({
+      code: "VERIFICATION_CODE_EXPIRED",
+      message: `Verification code for ${signer.email} expired at ${pending.expires_at}.`,
+      hint: "Re-issue with `sign signer send-verification`.",
+      details: { requestId: request.id, signerEmail: signer.email, expiresAt: pending.expires_at },
+    });
+  }
+  if (pending.attempts >= VERIFICATION_MAX_ATTEMPTS) {
+    throw new SignCliError({
+      code: "VERIFICATION_CODE_INVALID",
+      message: `Verification code for ${signer.email} is locked after ${VERIFICATION_MAX_ATTEMPTS} failed attempts.`,
+      hint: "Re-issue with `sign signer send-verification`.",
+      details: { requestId: request.id, signerEmail: signer.email },
+    });
+  }
+  if (sha256(input.code.trim()) !== pending.code_hash) {
+    db.prepare(
+      "UPDATE signer_email_verifications SET attempts = attempts + 1 WHERE id = ?",
+    ).run(pending.id);
+    throw new SignCliError({
+      code: "VERIFICATION_CODE_INVALID",
+      message: `Verification code does not match for ${signer.email}.`,
+      hint: `Attempts used: ${pending.attempts + 1}/${VERIFICATION_MAX_ATTEMPTS}. Check the code with the signer, or re-issue.`,
+      details: { requestId: request.id, signerEmail: signer.email },
+    });
+  }
+
+  const verifiedAt = nowIso(now);
+  db.prepare(
+    "UPDATE signer_email_verifications SET verified_at = ? WHERE id = ?",
+  ).run(verifiedAt, pending.id);
+  appendAuditEvent(db, {
+    requestId: request.id,
+    eventType: "request.signer_email_verified",
+    payload: {
+      signerEmail: signer.email,
+      signerOrder: signer.order,
+      codeHint: pending.code_hint,
+      verifiedAt,
+    },
+    now,
+  });
+  return { requestId: request.id, signerEmail: signer.email, verifiedAt, codeHint: pending.code_hint };
+}
+
+/**
+ * Record HOW the operator verified a signer's identity out-of-band. Stores the
+ * assertion (method + a pointer to evidence) in the audit chain — deliberately
+ * NOT the identity evidence itself.
+ */
+export function recordIdentityAssurance(
+  db: SqliteDb,
+  input: { requestId: string; signerEmail: string; assurance: IdentityAssuranceInput; now?: Date },
+): { requestId: string; signerEmail: string; recordedAt: string; method: string } {
+  const request = getRequestRow(db, input.requestId);
+  const signer = findSignerOnRequest(request, input.signerEmail);
+  const now = input.now ?? new Date();
+  const recordedAt = nowIso(now);
+  appendAuditEvent(db, {
+    requestId: request.id,
+    eventType: "request.identity_assurance_recorded",
+    payload: {
+      signerEmail: signer.email,
+      signerOrder: signer.order,
+      method: input.assurance.method,
+      verifier: input.assurance.verifier ?? null,
+      reference: input.assurance.reference ?? null,
+      notes: input.assurance.notes ?? null,
+      recordedAt,
+    },
+    now,
+  });
+  return { requestId: request.id, signerEmail: signer.email, recordedAt, method: input.assurance.method };
+}
+
+// Shared by approve + sign so the gates hold on every surface (CLI, MCP `sign`
+// tool, `POST /v1/sign`) — the token alone must not be enough to sign when the
+// requester opted into consent / email-verification.
+function enforceConsentGates(db: SqliteDb, request: RequestRow, signerEmail: string): void {
+  if (requestRequiresEmailVerification(request) && !getVerifiedEmailAt(db, request.id, signerEmail)) {
+    throw new SignCliError({
+      code: "EMAIL_VERIFICATION_REQUIRED",
+      message: `Request ${request.id} requires email verification, and ${signerEmail} has not verified yet.`,
+      hint: "Requester: `sign signer send-verification --request-id <id> --email <signer>`. " +
+        "Signer: `sign signer verify-email --request-id <id> --email <you> --code <code>` (or pass --verification-code to approve).",
+      details: { requestId: request.id, signerEmail },
+    });
+  }
+  if (requestRequiresConsent(request)) {
+    const intent = getSignerConsent(db, request.id, signerEmail, "intent_to_sign");
+    const disclosure = getSignerConsent(db, request.id, signerEmail, "esign_disclosure");
+    if (!intent || !disclosure) {
+      throw new SignCliError({
+        code: "CONSENT_REQUIRED",
+        message: `Request ${request.id} requires signer consent, and ${signerEmail} has not completed it.`,
+        hint: "Read the statements with `sign consent show`, then run " +
+          "`sign approve --request-id <id> --token <token> --agree true --accept-disclosure true`.",
+        details: {
+          requestId: request.id,
+          signerEmail,
+          intentToSignCaptured: Boolean(intent),
+          esignDisclosureAccepted: Boolean(disclosure),
+        },
+      });
+    }
+  }
+}
+
+export type SignerConsentStateEntry = {
+  signerEmail: string;
+  intentToSignAcceptedAt: string | null;
+  esignDisclosureAcceptedAt: string | null;
+  emailVerifiedAt: string | null;
+};
+
+export function listSignerConsentState(db: SqliteDb, request: RequestRow): SignerConsentStateEntry[] {
+  const signers = JSON.parse(request.signers_json) as SignerInput[];
+  return signers.map((signer) => ({
+    signerEmail: signer.email,
+    intentToSignAcceptedAt: getSignerConsent(db, request.id, signer.email, "intent_to_sign")?.accepted_at ?? null,
+    esignDisclosureAcceptedAt: getSignerConsent(db, request.id, signer.email, "esign_disclosure")?.accepted_at ?? null,
+    emailVerifiedAt: getVerifiedEmailAt(db, request.id, signer.email),
+  }));
+}
+
 export function approveSigningRequest(
   db: SqliteDb,
-  input: { requestId: string; token: string; now?: Date },
+  input: {
+    requestId: string;
+    token: string;
+    /** Signer's affirmative intent-to-sign attestation (records the canonical statement). */
+    agree?: boolean;
+    /** Signer accepts the electronic-records (ESIGN) disclosure. */
+    acceptDisclosure?: boolean;
+    /** One-step email verification: consumes the code issued by `signer send-verification`. */
+    verificationCode?: string;
+    /** Operator-attested out-of-band identity check, recorded in the audit chain. */
+    identityAssurance?: IdentityAssuranceInput;
+    now?: Date;
+  },
 ): {
   approvalId: string;
   signerEmail: string;
   requestStatus: string;
+  consent?: { intentToSignAcceptedAt?: string; esignDisclosureAcceptedAt?: string };
+  emailVerifiedAt?: string;
 } {
   const now = input.now ?? new Date();
   const tokenHash = sha256(input.token);
@@ -1284,6 +1707,49 @@ export function approveSigningRequest(
     throw new Error("Approval token is not valid for the current document hash.");
   }
 
+  // One-step email verification: consume the code before the gate check.
+  let emailVerifiedAt: string | undefined;
+  if (input.verificationCode) {
+    emailVerifiedAt = verifySignerEmailCode(db, {
+      requestId: input.requestId,
+      signerEmail: approval.signer_email,
+      code: input.verificationCode,
+      now,
+    }).verifiedAt;
+  }
+
+  // Consent capture happens BEFORE the gate so a single approve call with
+  // --agree/--accept-disclosure both records and satisfies the requirement.
+  const consent: { intentToSignAcceptedAt?: string; esignDisclosureAcceptedAt?: string } = {};
+  if (input.agree) {
+    consent.intentToSignAcceptedAt = recordSignerConsent(db, {
+      requestId: input.requestId,
+      signerEmail: approval.signer_email,
+      signerOrder: approval.signer_order,
+      statement: INTENT_TO_SIGN_STATEMENT,
+      now,
+    }).acceptedAt;
+  }
+  if (input.acceptDisclosure) {
+    consent.esignDisclosureAcceptedAt = recordSignerConsent(db, {
+      requestId: input.requestId,
+      signerEmail: approval.signer_email,
+      signerOrder: approval.signer_order,
+      statement: ESIGN_DISCLOSURE_STATEMENT,
+      now,
+    }).acceptedAt;
+  }
+  if (input.identityAssurance) {
+    recordIdentityAssurance(db, {
+      requestId: input.requestId,
+      signerEmail: approval.signer_email,
+      assurance: input.identityAssurance,
+      now,
+    });
+  }
+
+  enforceConsentGates(db, request, approval.signer_email);
+
   const nowStamp = nowIso(now);
   markApprovalUsed(db, approval.id, nowStamp);
 
@@ -1302,6 +1768,9 @@ export function approveSigningRequest(
       signerEmail: approval.signer_email,
       signerOrder: approval.signer_order,
       requestStatus: nextStatus,
+      intentToSignCaptured: Boolean(consent.intentToSignAcceptedAt),
+      esignDisclosureAccepted: Boolean(consent.esignDisclosureAcceptedAt),
+      emailVerified: Boolean(emailVerifiedAt ?? getVerifiedEmailAt(db, input.requestId, approval.signer_email)),
     },
     now,
   });
@@ -1310,6 +1779,8 @@ export function approveSigningRequest(
     approvalId: approval.id,
     signerEmail: approval.signer_email,
     requestStatus: nextStatus,
+    ...(consent.intentToSignAcceptedAt || consent.esignDisclosureAcceptedAt ? { consent } : {}),
+    ...(emailVerifiedAt ? { emailVerifiedAt } : {}),
   };
 }
 
@@ -2432,6 +2903,11 @@ export type RequestSnapshot = {
   signedBy: SnapshotSignedByEntry[] | null;
   declinedBy: string | null;
   declineReason: string | null;
+  consent: {
+    consentRequired: boolean;
+    emailVerificationRequired: boolean;
+    signers: SignerConsentStateEntry[];
+  };
   nextSteps: string[];
   metrics?: RequestSnapshotMetrics;
 };
@@ -2677,6 +3153,11 @@ export function getRequestSnapshot(
     signedBy,
     declinedBy,
     declineReason,
+    consent: {
+      consentRequired: requestRequiresConsent(requestRow),
+      emailVerificationRequired: requestRequiresEmailVerification(requestRow),
+      signers: listSignerConsentState(db, requestRow),
+    },
     nextSteps,
     ...(metrics ? { metrics } : {}),
   };
@@ -3900,6 +4381,10 @@ export function signSigningRequest(
     requireTitle: input.requireTitle,
     requireSignerEmail: input.requireSignerEmail,
   });
+  // The token alone must not sign past the consent / email-verification gates:
+  // `sign` is reachable from MCP and HTTP as well as the CLI, and approve is
+  // not a prerequisite of sign.
+  enforceConsentGates(db, request, signer.email);
 
   const providerRequestId = getProviderRequestId(request)!;
   const beforeRecord = readLocalDocument(providerRequestId);

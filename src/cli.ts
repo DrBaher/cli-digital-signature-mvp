@@ -77,6 +77,9 @@ import {
   listSigningRequests,
   REQUEST_WATCH_EXIT_CODES,
   reissueSignerToken,
+  issueSignerEmailVerification,
+  verifySignerEmailCode,
+  recordIdentityAssurance,
   remindSigningRequest,
   rerunPolicyForRequest,
   runSignerPolicy,
@@ -98,6 +101,7 @@ import { loadPolicySpec } from "./lib/policy-engine.js";
 import { parseImageInput, stampImageOnPdf, type StampPosition } from "./lib/pdf-image-stamp.js";
 import { loadRequestSpec } from "./lib/request-spec.js";
 import { parseBooleanFlag, parsePrefillSpec, parseSignerSpec } from "./lib/util.js";
+import { describeConsentStatements, parseIdentityAssuranceSpec } from "./lib/consent.js";
 import { loadWebhookPayloadFile, verifyDropboxCallback } from "./lib/webhook.js";
 import { startWebhookServer } from "./lib/webhook-server.js";
 
@@ -234,7 +238,8 @@ function printUsage(): void {
 sign request create --spec ./request.json   (CLI flags --provider and --auto-approve still apply on top of the spec)
 sign request run-email --title "Doc" --document ./file.pdf [--document ./extra.pdf] --signer name:Alice,email:alice@example.com,order:1 [--field signer:1,doc:0,page:1,x:100,y:200,type:signature] [--provider dropbox|docusign|signwell] [--test-mode true]
 sign request from-template --template-id <id> --signer role:Buyer,name:Alice,email:alice@example.com,order:1 [--prefill name:purchase_price,value:1000] [--title "..."] [--provider dropbox|docusign|signwell] [--auto-approve true]
-sign approve --request-id <id> --token <token>
+sign approve --request-id <id> --token <token> [--agree true] [--accept-disclosure true] [--verification-code <code>] [--identity-assurance method:...,verifier:...,reference:...]
+sign consent show   (print the canonical intent-to-sign + electronic-records disclosure texts, version ids, SHA-256)
 sign sign --request-id <id> --token <token> [--signer-email <e>] [--signer-name <n>] [--require-hash <sha256>] [--require-title <regex>] [--require-signer-email <e>] [--signature-image <path-or-data-url> [--image-page <n> --image-x <pt> --image-y <pt> --image-width <pt> --image-height <pt>]]
 sign pdf stamp --pdf ./doc.pdf --image ./sig.png|sig.svg|"data:image/svg+xml;base64,..." --image-page 1 --image-x 100 --image-y 200 --image-width 150 --image-height 60 --out ./stamped.pdf   (standalone — no signing request involved; SVG is rasterized at ~300 DPI of the target rectangle)
 sign pdf stamp verify --pdf ./stamped.pdf --image-page 1 --image-x 100 --image-y 200 --image-width 150 --image-height 60
@@ -246,6 +251,9 @@ sign signer list [--signer-email <e>]
 sign signer fetch-document --request-id <id> --token <token> [--out ./doc.pdf] [--signer-email <e>]
 sign signer decline --request-id <id> --token <token> [--signer-email <e>] [--reason "..."]
 sign signer reissue-token --request-id <id> --signer-email <e> [--token-ttl-minutes 30]
+sign signer send-verification --request-id <id> --email <signer> [--ttl-minutes 15]   (issue an email-verification code; delivered via SIGN_VERIFICATION_WEBHOOK_URL or out-of-band)
+sign signer verify-email --request-id <id> --email <signer> --code <6-digit>   (redeem the code; records request.signer_email_verified)
+sign signer record-identity --request-id <id> --email <signer> --identity-assurance method:in-person[,verifier:...][,reference:...]   (record how identity was checked — the assertion, not the evidence)
 sign signer watch [--signer-email <e>] [--exit-on-first true] [--interval-seconds 1] [--timeout-seconds 600]
 sign signer policy run --request-id <id> --token <token> --spec ./policy.json [--dry-run true]
 sign signer policy run-all --tokens-file ./tokens.json --spec ./policy.json [--signer-email <e>] [--dry-run true]   (apply policy to every pending request the agent has a token for)
@@ -845,6 +853,8 @@ async function main(): Promise<void> {
       const provider = flagValue(parsed, "provider") ? selectedProvider : (spec.provider ?? selectedProvider);
       const autoApproveFlag = flagValue(parsed, "auto-approve");
       const autoApprove = autoApproveFlag !== undefined ? autoApproveFlag === "true" : Boolean(spec.autoApprove);
+      const requireConsentFlag = flagValue(parsed, "require-consent");
+      const requireEmailVerificationFlag = flagValue(parsed, "require-email-verification");
       const result = createSigningRequest(db, {
         title: spec.title,
         ...(spec.documentPath ? { documentPath: spec.documentPath } : {}),
@@ -856,6 +866,10 @@ async function main(): Promise<void> {
         tokenTtlMinutes: spec.tokenTtlMinutes ?? 60,
         provider,
         autoApprove,
+        requireConsent: requireConsentFlag !== undefined ? requireConsentFlag === "true" : Boolean(spec.requireConsent),
+        requireEmailVerification: requireEmailVerificationFlag !== undefined
+          ? requireEmailVerificationFlag === "true"
+          : Boolean(spec.requireEmailVerification),
         ...(flagValue(parsed, "idempotency-key") ? { idempotencyKey: flagValue(parsed, "idempotency-key")! } : {}),
       });
       console.log(JSON.stringify(result, null, 2));
@@ -882,6 +896,8 @@ async function main(): Promise<void> {
       tokenTtlMinutes,
       provider: selectedProvider,
       autoApprove: (flagValue(parsed, "auto-approve") ?? "false") === "true",
+      requireConsent: (flagValue(parsed, "require-consent") ?? "false") === "true",
+      requireEmailVerification: (flagValue(parsed, "require-email-verification") ?? "false") === "true",
       ...(flagValue(parsed, "idempotency-key") ? { idempotencyKey: flagValue(parsed, "idempotency-key")! } : {}),
     });
     emitJsonWithProvider(result, resolvedProvider);
@@ -891,8 +907,21 @@ async function main(): Promise<void> {
   if (root === "approve") {
     const requestId = flagValue(parsed, "request-id", true)!;
     const token = flagValue(parsed, "token", true)!;
-    const result = approveSigningRequest(db, { requestId, token });
+    const identityAssuranceSpec = flagValue(parsed, "identity-assurance");
+    const result = approveSigningRequest(db, {
+      requestId,
+      token,
+      agree: (flagValue(parsed, "agree") ?? "false") === "true",
+      acceptDisclosure: (flagValue(parsed, "accept-disclosure") ?? "false") === "true",
+      verificationCode: flagValue(parsed, "verification-code"),
+      ...(identityAssuranceSpec ? { identityAssurance: parseIdentityAssuranceSpec(identityAssuranceSpec) } : {}),
+    });
     console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (root === "consent" && (sub === "show" || sub === undefined)) {
+    console.log(JSON.stringify({ statements: describeConsentStatements() }, null, 2));
     return;
   }
 
@@ -1739,6 +1768,50 @@ async function main(): Promise<void> {
     });
     console.log(JSON.stringify(outcome, null, 2));
     process.exitCode = outcome.exitReason === "timeout" ? 4 : 0;
+    return;
+  }
+
+  if (root === "signer" && sub === "send-verification") {
+    const requestId = flagValue(parsed, "request-id", true)!;
+    const signerEmail = flagValue(parsed, "email", true)!;
+    const ttl = flagValue(parsed, "ttl-minutes");
+    const result = await issueSignerEmailVerification(db, {
+      requestId,
+      signerEmail,
+      ttlMinutes: ttl ? Number(ttl) : undefined,
+    });
+    if (result.deliveredVia === "manual") {
+      process.stderr.write(
+        "[send-verification] No verification webhook delivered this code — pass it to the signer's " +
+        "email mailbox yourself. The attribution value of the verification depends on that delivery.\n",
+      );
+    }
+    if (result.deliveryError) {
+      process.stderr.write(`[send-verification] ${result.deliveryError}\n`);
+    }
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (root === "signer" && sub === "verify-email") {
+    const requestId = flagValue(parsed, "request-id", true)!;
+    const signerEmail = flagValue(parsed, "email", true)!;
+    const code = flagValue(parsed, "code", true)!;
+    const result = verifySignerEmailCode(db, { requestId, signerEmail, code });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  if (root === "signer" && sub === "record-identity") {
+    const requestId = flagValue(parsed, "request-id", true)!;
+    const signerEmail = flagValue(parsed, "email", true)!;
+    const spec = flagValue(parsed, "identity-assurance", true)!;
+    const result = recordIdentityAssurance(db, {
+      requestId,
+      signerEmail,
+      assurance: parseIdentityAssuranceSpec(spec),
+    });
+    console.log(JSON.stringify(result, null, 2));
     return;
   }
 

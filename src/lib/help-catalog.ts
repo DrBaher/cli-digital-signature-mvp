@@ -143,7 +143,9 @@ export const HELP_CATALOG: CommandSpec[] = [
       { name: "--field", description: "Field placement (repeatable). Keys: signer:N (1-based, matches --signer order), doc:N (0-based document index), page:N (1-based), x:N, y:N (provider pixels, top-left origin), type:signature|initials|date|text|name|email (default signature), width:N, height:N, required:true|false (default true). Anchor strings are not supported via this CLI. See docs/field-coordinates.md for the per-provider coordinate contract." },
       { name: "--prefill", description: "Template prefill name:K,value:V[,signer:N]." },
       { name: "--token-ttl-minutes", description: "Token lifetime in minutes (default 60)." },
-      { name: "--auto-approve", description: "true to skip the approval gate (default false)." },
+      { name: "--auto-approve", description: "true to skip the approval gate (default false). Cannot be combined with --require-consent / --require-email-verification." },
+      { name: "--require-consent", description: "true to require every signer to attest intent-to-sign + accept the electronic-records disclosure (approve --agree true --accept-disclosure true) before they can sign. See `sign consent show`." },
+      { name: "--require-email-verification", description: "true to require every signer to prove control of their email with a verification code (`signer send-verification` / `signer verify-email`) before they can sign." },
       { name: "--provider", description: "dropbox | docusign | signwell | local." },
       { name: "--spec", description: "Load all of the above from a JSON file." },
       { name: "--param", description: "key=value substituted into spec via {{key}} (repeatable)." },
@@ -449,11 +451,22 @@ export const HELP_CATALOG: CommandSpec[] = [
   // Signer-side
   {
     command: "approve",
-    summary: "Spend the signer's approval token (the requester pre-flight gate).",
+    summary: "Spend the signer's approval token (the requester pre-flight gate). Optionally capture consent attestations while doing so.",
     flags: [
       { name: "--request-id", required: true, description: "Request id." },
       { name: "--token", required: true, description: "Per-signer token from request create." },
+      { name: "--agree", description: "true = attest intent to sign (records the canonical intent-to-sign statement in the audit chain). Required when the request was created with --require-consent." },
+      { name: "--accept-disclosure", description: "true = accept the electronic-records (ESIGN) disclosure. Required when the request was created with --require-consent. Read both texts with `sign consent show`." },
+      { name: "--verification-code", description: "One-step email verification: the code issued by `signer send-verification`." },
+      { name: "--identity-assurance", description: "Record how the signer's identity was checked out-of-band: method:<in-person|video-call|document-check|provider-idv|known-contact|other>[,verifier:...][,reference:...][,notes:...]. Store a pointer to evidence, never the evidence itself." },
     ],
+    example:
+      `sign approve --request-id req_abc --token alice-tok-... \\\n` +
+      `  --agree true --accept-disclosure true`,
+  },
+  {
+    command: "consent show",
+    summary: "Print the canonical consent statements (intent-to-sign + electronic-records disclosure) with their version ids and SHA-256 — the exact texts recorded when a signer approves with --agree / --accept-disclosure.",
   },
   {
     command: "sign",
@@ -499,6 +512,34 @@ export const HELP_CATALOG: CommandSpec[] = [
   {
     command: "signer reissue-token",
     summary: "Mint a new per-signer token and invalidate the old one.",
+  },
+  {
+    command: "signer send-verification",
+    summary: "Issue a 6-digit email-verification code for a signer (invalidates prior unverified codes). Only the code's hash is stored; the plaintext is returned once for delivery to the signer's mailbox — via SIGN_VERIFICATION_WEBHOOK_URL if set, otherwise deliver it out-of-band.",
+    flags: [
+      { name: "--request-id", required: true, description: "Request id." },
+      { name: "--email", required: true, description: "Signer email (must be on the request)." },
+      { name: "--ttl-minutes", description: "Code lifetime (default 15)." },
+    ],
+  },
+  {
+    command: "signer verify-email",
+    summary: "Redeem a verification code, proving the signer controls the mailbox. Records request.signer_email_verified in the audit chain. 5 wrong attempts lock the code (re-issue to retry).",
+    flags: [
+      { name: "--request-id", required: true, description: "Request id." },
+      { name: "--email", required: true, description: "Signer email." },
+      { name: "--code", required: true, description: "The 6-digit code from signer send-verification." },
+    ],
+  },
+  {
+    command: "signer record-identity",
+    summary: "Record an out-of-band identity check for a signer in the audit chain (the assertion, not the evidence). Also available inline on approve via --identity-assurance.",
+    flags: [
+      { name: "--request-id", required: true, description: "Request id." },
+      { name: "--email", required: true, description: "Signer email." },
+      { name: "--identity-assurance", required: true, description: "method:<in-person|video-call|document-check|provider-idv|known-contact|other>[,verifier:...][,reference:...][,notes:...]" },
+    ],
+    example: `sign signer record-identity --request-id req_abc --email alice@example.com \\\n  --identity-assurance method:video-call,verifier:ops@acme.com,reference:TICKET-123`,
   },
   {
     command: "signer watch",

@@ -17,6 +17,8 @@ export type RequestSpec = {
   tokenTtlMinutes?: number;
   provider?: SignProvider;
   autoApprove?: boolean;
+  requireConsent?: boolean;
+  requireEmailVerification?: boolean;
 };
 
 function specError(message: string, details?: Record<string, unknown>): SignCliError {
@@ -139,6 +141,9 @@ export function parseRequestSpec(raw: unknown): RequestSpec {
   }
   const provider = raw.provider === undefined ? undefined : resolveSignProvider(ensureString(raw.provider, "provider"));
   const autoApprove = raw.autoApprove === undefined ? undefined : Boolean(raw.autoApprove);
+  const requireConsent = raw.requireConsent === undefined ? undefined : Boolean(raw.requireConsent);
+  const requireEmailVerification =
+    raw.requireEmailVerification === undefined ? undefined : Boolean(raw.requireEmailVerification);
 
   return {
     title,
@@ -151,6 +156,8 @@ export function parseRequestSpec(raw: unknown): RequestSpec {
     ...(tokenTtlMinutes !== undefined ? { tokenTtlMinutes } : {}),
     ...(provider !== undefined ? { provider } : {}),
     ...(autoApprove !== undefined ? { autoApprove } : {}),
+    ...(requireConsent !== undefined ? { requireConsent } : {}),
+    ...(requireEmailVerification !== undefined ? { requireEmailVerification } : {}),
   };
 }
 
